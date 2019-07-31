@@ -235,22 +235,35 @@ public:
       * if (inserted)
       *     new(&it->second) Mapped(value);
       */
-    void ALWAYS_INLINE emplace(Key x, iterator & it, bool & inserted)
+    template <typename KeyPtr>
+    void ALWAYS_INLINE emplacePtr(KeyPtr & key_ptr, iterator & it, bool & inserted)
     {
-        size_t hash_value = hash(x);
-        emplace(x, it, inserted, hash_value);
+        size_t hash_value = hash(*key_ptr);
+        emplacePtr(key_ptr, it, inserted, hash_value);
+    }
+
+    void ALWAYS_INLINE emplace(Key key, iterator & it, bool & inserted)
+    {
+        NoopKeyPtr<Key> key_ptr(key);
+        emplacePtr(key_ptr, it, inserted);
     }
 
 
     /// Same, but with a precalculated values of hash function.
-    void ALWAYS_INLINE emplace(Key x, iterator & it, bool & inserted, size_t hash_value)
+    template <typename KeyPtr>
+    void ALWAYS_INLINE emplacePtr(KeyPtr & key_ptr, iterator & it, bool & inserted, size_t hash_value)
     {
         size_t buck = getBucketFromHash(hash_value);
         typename Impl::iterator impl_it;
-        impls[buck].emplace(x, impl_it, inserted, hash_value);
+        impls[buck].emplacePtr(key_ptr, impl_it, inserted, hash_value);
         it = iterator(this, buck, impl_it);
     }
 
+    void ALWAYS_INLINE emplace(Key key, iterator & it, bool & inserted, size_t hash_value)
+    {
+        NoopKeyPtr<Key> key_ptr(key);
+        emplacePtr(key_ptr, it, inserted, hash_value);
+    }
 
     iterator ALWAYS_INLINE find(Key x, size_t hash_value)
     {

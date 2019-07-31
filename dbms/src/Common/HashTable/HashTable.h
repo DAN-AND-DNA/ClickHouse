@@ -243,6 +243,47 @@ struct ZeroValueStorage<false, Cell>
     const Cell * zeroValue() const { return nullptr; }
 };
 
+/**
+  * In some aggregation scenarios, when adding a key to the hash table, we
+  * start with a temporary key object, and if it turns out to be a new key,
+  * we make it persistent (e.g. copy to an Arena) and update the hash table cell.
+  * For a plain HashTable, this can be done by the caller: HashTable returns
+  * whether the key was new, and an iterator to the corresponding cell.
+  * The caller makes the key persistent, and updates the HashTable cell through
+  * the iterator.
+  * However, we also support compound hash tables such as StringHashTable.
+  * For these, whether the key should be made persistent is decided by the
+  * hash table itself, depending on the key (e.g. in StringHashTable, short keys
+  * are stored in-place and don't require an external persistent copy).
+  * We can't mirror the logic of a particular hash table in the calling code,
+  * so the hash table must have some way to control key persistence. To that end,
+  * the hash table has emplacePtr() methods that accept a pointer-like object
+  * containing the key, that also has methods to control its persistence.
+  * The interface is described in the no-op implementation of such a pointer --
+  * NoopKeyPtr.
+  */
+template<typename Key>
+struct NoopKeyPtr
+{
+    Key key;
+
+    NoopKeyPtr(Key key_) : key(key_) {}
+    // FIXME this should be removed. Done for uniformity with ArenaKeyPtr
+    NoopKeyPtr(Key key_, DB::Arena &) : key(key_) {}
+
+    /** Dereference operator -- returns the key.
+      * Can return the temporary key initially.
+      * After the call to persist(), must return the persistent key.
+      */
+    Key & operator * () { return key; }
+
+    /** Make the key persistent.
+      * Returns the persistent key.
+      * The dereference operator should always return persistent key
+      * after this call.
+      */
+    Key & persist() { return key; }
+};
 
 template
 <
@@ -632,6 +673,8 @@ protected:
 
 
     /// If the key is zero, insert it into a special place and return true.
+    /// We don't have to persist a zero key, because it's not actually inserted.
+    /// That's why we just take a Key by value, an not a smart pointer to it.
     bool ALWAYS_INLINE emplaceIfZero(Key x, iterator & it, bool & inserted, size_t hash_value)
     {
         /// If it is claimed that the zero key can not be inserted into the table.
@@ -657,7 +700,8 @@ protected:
         return false;
     }
 
-    void ALWAYS_INLINE emplaceNonZeroImpl(size_t place_value, Key x, iterator & it, bool & inserted, size_t hash_value)
+    template<typename KeyPtr>
+    void ALWAYS_INLINE emplaceNonZeroImpl(size_t place_value, KeyPtr & key_ptr, iterator & it, bool & inserted, size_t hash_value)
     {
         it = iterator(this, &buf[place_value]);
 
@@ -667,7 +711,9 @@ protected:
             return;
         }
 
-        new(&buf[place_value]) Cell(x, *this);
+        const auto & key = key_ptr.persist();
+
+        new(&buf[place_value]) Cell(key, *this);
         buf[place_value].setHash(hash_value);
         inserted = true;
         ++m_size;
@@ -689,23 +735,24 @@ protected:
                 throw;
             }
 
-            it = find(x, hash_value);
+            it = find(key, hash_value);
         }
     }
 
     /// Only for non-zero keys. Find the right place, insert the key there, if it does not already exist. Set iterator to the cell in output parameter.
-    void ALWAYS_INLINE emplaceNonZero(Key x, iterator & it, bool & inserted, size_t hash_value)
+    template <typename KeyPtr>
+    void ALWAYS_INLINE emplaceNonZero(KeyPtr & key_ptr, iterator & it, bool & inserted, size_t hash_value)
     {
-        size_t place_value = findCell(x, hash_value, grower.place(hash_value));
-        emplaceNonZeroImpl(place_value, x, it, inserted, hash_value);
+        size_t place_value = findCell(*key_ptr, hash_value, grower.place(hash_value));
+        emplaceNonZeroImpl(place_value, key_ptr, it, inserted, hash_value);
     }
 
     /// Same but find place using object. Hack for ReverseIndex.
-    template <typename ObjectToCompareWith>
-    void ALWAYS_INLINE emplaceNonZero(Key x, iterator & it, bool & inserted, size_t hash_value, const ObjectToCompareWith & object)
+    template <typename KeyPtr, typename ObjectToCompareWith>
+    void ALWAYS_INLINE emplaceNonZero(KeyPtr & key_ptr, iterator & it, bool & inserted, size_t hash_value, const ObjectToCompareWith & object)
     {
         size_t place_value = findCell(object, hash_value, grower.place(hash_value));
-        emplaceNonZeroImpl(place_value, x, it, inserted, hash_value);
+        emplaceNonZeroImpl(place_value, key_ptr, it, inserted, hash_value);
     }
 
 
@@ -717,7 +764,10 @@ public:
 
         size_t hash_value = hash(Cell::getKey(x));
         if (!emplaceIfZero(Cell::getKey(x), res.first, res.second, hash_value))
-            emplaceNonZero(Cell::getKey(x), res.first, res.second, hash_value);
+        {
+            NoopKeyPtr<Key> key_ptr(Cell::getKey(x));
+            emplaceNonZero(key_ptr, res.first, res.second, hash_value);
+        }
 
         if (res.second)
             res.first.ptr->setMapped(x);
@@ -748,27 +798,42 @@ public:
       * if (inserted)
       *     new(&it->second) Mapped(value);
       */
-    void ALWAYS_INLINE emplace(Key x, iterator & it, bool & inserted)
+    template <typename KeyPtr>
+    void ALWAYS_INLINE emplacePtr(KeyPtr & key_ptr, iterator & it, bool & inserted)
     {
-        size_t hash_value = hash(x);
-        if (!emplaceIfZero(x, it, inserted, hash_value))
-            emplaceNonZero(x, it, inserted, hash_value);
+        emplacePtr(key_ptr, it, inserted, hash(*key_ptr));
+    }
+
+    void ALWAYS_INLINE emplace(Key key, iterator & it, bool & inserted)
+    {
+        NoopKeyPtr<Key> key_ptr(key);
+        emplacePtr(key_ptr, it, inserted);
     }
 
 
     /// Same, but with a precalculated value of hash function.
-    void ALWAYS_INLINE emplace(Key x, iterator & it, bool & inserted, size_t hash_value)
+    void ALWAYS_INLINE emplace(Key key, iterator & it, bool & inserted, size_t hash_value)
     {
-        if (!emplaceIfZero(x, it, inserted, hash_value))
-            emplaceNonZero(x, it, inserted, hash_value);
+        NoopKeyPtr<Key> key_ptr(key);
+        emplacePtr(key_ptr, it, inserted, hash_value);
+    }
+
+    template <typename KeyPtr>
+    void ALWAYS_INLINE emplacePtr(KeyPtr & key_ptr, iterator & it, bool & inserted, size_t hash_value)
+    {
+        if (!emplaceIfZero(*key_ptr, it, inserted, hash_value))
+            emplaceNonZero(key_ptr, it, inserted, hash_value);
     }
 
     /// Same, but search position by object. Hack for ReverseIndex.
     template <typename ObjectToCompareWith>
-    void ALWAYS_INLINE emplace(Key x, iterator & it, bool & inserted, size_t hash_value, const ObjectToCompareWith & object)
+    void ALWAYS_INLINE emplace(Key key, iterator & it, bool & inserted, size_t hash_value, const ObjectToCompareWith & object)
     {
-        if (!emplaceIfZero(x, it, inserted, hash_value))
-            emplaceNonZero(x, it, inserted, hash_value, object);
+        if (!emplaceIfZero(key, it, inserted, hash_value))
+        {
+            NoopKeyPtr<Key> key_ptr(key);
+            emplaceNonZero(key_ptr, it, inserted, hash_value, object);
+        }
     }
 
     /// Copy the cell from another hash table. It is assumed that the cell is not zero, and also that there was no such key in the table yet.

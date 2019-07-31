@@ -294,6 +294,18 @@ public:
     void ALWAYS_INLINE emplace(Key x, iterator & it, bool & inserted) { emplaceImpl(x, it, inserted); }
     void ALWAYS_INLINE emplace(Key x, iterator & it, bool & inserted, size_t) { emplaceImpl(x, it, inserted); }
 
+    // FixedHashTable doesn't store references to the keys, so it doesn't care
+    // about key persistence.
+    template <typename KeyPtr>
+    void emplacePtr(KeyPtr key_ptr, iterator & it, bool & inserted) { emplace(*key_ptr, it, inserted); }
+
+    template <typename KeyPtr>
+    void emplacePtr(KeyPtr key_ptr, iterator & it, bool & inserted, size_t )
+    {
+        emplace(*key_ptr, it, inserted);
+    }
+
+
     template <typename ObjectToCompareWith>
     iterator ALWAYS_INLINE find(ObjectToCompareWith x)
     {
