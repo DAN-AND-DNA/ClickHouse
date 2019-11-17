@@ -1,3 +1,5 @@
+#if defined(__ELF__) && !defined(__FreeBSD__)
+
 #include <Common/SymbolIndex.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
@@ -92,3 +94,5 @@ void registerFunctionAddressToSymbol(FunctionFactory & factory)
 }
 
 }
+
+#endif

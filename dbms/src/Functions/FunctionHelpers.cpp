@@ -4,7 +4,10 @@
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnLowCardinality.h>
+#include <Common/assert_cast.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <IO/WriteHelpers.h>
 
 
@@ -15,6 +18,7 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int SIZES_OF_ARRAYS_DOESNT_MATCH;
 }
 
 const ColumnConst * checkAndGetColumnConstStringOrFixedString(const IColumn * column)
@@ -22,7 +26,7 @@ const ColumnConst * checkAndGetColumnConstStringOrFixedString(const IColumn * co
     if (!isColumnConst(*column))
         return {};
 
-    const ColumnConst * res = static_cast<const ColumnConst *>(column);
+    const ColumnConst * res = assert_cast<const ColumnConst *>(column);
 
     if (checkColumn<ColumnString>(&res->getDataColumn())
         || checkColumn<ColumnFixedString>(&res->getDataColumn()))
@@ -34,7 +38,7 @@ const ColumnConst * checkAndGetColumnConstStringOrFixedString(const IColumn * co
 
 Columns convertConstTupleToConstantElements(const ColumnConst & column)
 {
-    const ColumnTuple & src_tuple = static_cast<const ColumnTuple &>(column.getDataColumn());
+    const ColumnTuple & src_tuple = assert_cast<const ColumnTuple &>(column.getDataColumn());
     const auto & src_tuple_columns = src_tuple.getColumns();
     size_t tuple_size = src_tuple_columns.size();
     size_t rows = column.size();
@@ -113,6 +117,30 @@ void validateArgumentType(const IFunction & func, const DataTypes & arguments,
                         " argument of function " + func.getName() +
                         " expected " + expected_type_description,
                         ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+}
+
+std::pair<std::vector<const IColumn *>, const ColumnArray::Offset *>
+checkAndGetNestedArrayOffset(const IColumn ** columns, size_t num_arguments)
+{
+    assert(num_arguments > 0);
+    std::vector<const IColumn *> nested_columns(num_arguments);
+    const ColumnArray::Offsets * offsets = nullptr;
+    for (size_t i = 0; i < num_arguments; ++i)
+    {
+        const ColumnArray::Offsets * offsets_i = nullptr;
+        if (const ColumnArray * arr = checkAndGetColumn<const ColumnArray>(columns[i]))
+        {
+            nested_columns[i] = &arr->getData();
+            offsets_i = &arr->getOffsets();
+        }
+        else
+            throw Exception("Illegal column " + columns[i]->getName() + " as argument of function", ErrorCodes::ILLEGAL_COLUMN);
+        if (i == 0)
+            offsets = offsets_i;
+        else if (*offsets_i != *offsets)
+            throw Exception("Lengths of all arrays passed to aggregate function must be equal.", ErrorCodes::SIZES_OF_ARRAYS_DOESNT_MATCH);
+    }
+    return {nested_columns, offsets->data()};
 }
 
 }

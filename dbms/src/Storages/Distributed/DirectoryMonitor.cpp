@@ -6,6 +6,7 @@
 #include <Common/StringUtils/StringUtils.h>
 #include <Common/ClickHouseRevision.h>
 #include <Common/SipHash.h>
+#include <Common/quoteString.h>
 #include <Interpreters/Context.h>
 #include <Storages/Distributed/DirectoryMonitor.h>
 #include <IO/ReadBufferFromFile.h>
@@ -23,6 +24,7 @@
 namespace CurrentMetrics
 {
     extern const Metric DistributedSend;
+    extern const Metric DistributedFilesToInsert;
 }
 
 namespace DB
@@ -40,7 +42,6 @@ namespace ErrorCodes
 
 namespace
 {
-    static constexpr const std::chrono::seconds max_sleep_time{30};
     static constexpr const std::chrono::minutes decrease_error_count_period{5};
 
     template <typename PoolFactory>
@@ -60,13 +61,14 @@ namespace
 
 
 StorageDistributedDirectoryMonitor::StorageDistributedDirectoryMonitor(
-    StorageDistributed & storage, const std::string & name, const ConnectionPoolPtr & pool, ActionBlocker & monitor_blocker)
-    : storage(storage), pool{pool}, path{storage.path + name + '/'}
+    StorageDistributed & storage_, const std::string & name_, const ConnectionPoolPtr & pool_, ActionBlocker & monitor_blocker_)
+    : storage(storage_), pool{pool_}, path{storage.path + name_ + '/'}
     , current_batch_file_path{path + "current_batch.txt"}
     , default_sleep_time{storage.global_context.getSettingsRef().distributed_directory_monitor_sleep_time_ms.totalMilliseconds()}
     , sleep_time{default_sleep_time}
+    , max_sleep_time{storage.global_context.getSettingsRef().distributed_directory_monitor_max_sleep_time_ms.totalMilliseconds()}
     , log{&Logger::get(getLoggerName())}
-    , monitor_blocker(monitor_blocker)
+    , monitor_blocker(monitor_blocker_)
 {
     const Settings & settings = storage.global_context.getSettingsRef();
     should_batch_inserts = settings.distributed_directory_monitor_batch_inserts;
@@ -137,7 +139,7 @@ void StorageDistributedDirectoryMonitor::run()
                 ++error_count;
                 sleep_time = std::min(
                     std::chrono::milliseconds{Int64(default_sleep_time.count() * std::exp2(error_count))},
-                    std::chrono::milliseconds{max_sleep_time});
+                    max_sleep_time);
                 tryLogCurrentException(getLoggerName().data());
             }
         }
@@ -188,7 +190,9 @@ ConnectionPoolPtr StorageDistributedDirectoryMonitor::createPool(const std::stri
 
     auto pools = createPoolsForAddresses(name, pool_factory);
 
-    return pools.size() == 1 ? pools.front() : std::make_shared<ConnectionPoolWithFailover>(pools, LoadBalancing::RANDOM);
+    const auto settings = storage.global_context.getSettings();
+    return pools.size() == 1 ? pools.front() : std::make_shared<ConnectionPoolWithFailover>(pools, LoadBalancing::RANDOM,
+        settings.distributed_replica_error_half_life.totalSeconds(), settings.distributed_replica_error_cap);
 }
 
 
@@ -208,6 +212,8 @@ bool StorageDistributedDirectoryMonitor::processFiles()
 
     if (files.empty())
         return false;
+
+    CurrentMetrics::Increment metric_increment{CurrentMetrics::DistributedFilesToInsert, CurrentMetrics::Value(files.size())};
 
     if (should_batch_inserts)
     {
@@ -350,8 +356,19 @@ struct StorageDistributedDirectoryMonitor::Batch
             /// we must try to re-send exactly the same batches.
             /// So we save contents of the current batch into the current_batch_file_path file
             /// and truncate it afterwards if all went well.
-            WriteBufferFromFile out{parent.current_batch_file_path};
-            writeText(out);
+
+            /// Temporary file is required for atomicity.
+            String tmp_file{parent.current_batch_file_path + ".tmp"};
+
+            if (Poco::File{tmp_file}.exists())
+                LOG_ERROR(parent.log, "Temporary file " << backQuote(tmp_file) << " exists. Unclean shutdown?");
+
+            {
+                WriteBufferFromFile out{tmp_file, O_WRONLY | O_TRUNC | O_CREAT};
+                writeText(out);
+            }
+
+            Poco::File{tmp_file}.renameTo(parent.current_batch_file_path);
         }
         auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(parent.storage.global_context.getSettingsRef());
         auto connection = parent.pool->get(timeouts);
@@ -387,7 +404,8 @@ struct StorageDistributedDirectoryMonitor::Batch
                 remote->writePrepared(in);
             }
 
-            remote->writeSuffix();
+            if (remote)
+                remote->writeSuffix();
         }
         catch (const Exception & e)
         {

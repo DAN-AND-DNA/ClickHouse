@@ -1,6 +1,8 @@
 #include <Processors/Transforms/FilterTransform.h>
+
 #include <Interpreters/ExpressionActions.h>
 #include <Columns/ColumnsCommon.h>
+#include <Core/Field.h>
 
 namespace DB
 {
@@ -42,14 +44,14 @@ static Block transformHeader(
 }
 
 FilterTransform::FilterTransform(
-    const Block & header,
+    const Block & header_,
     ExpressionActionsPtr expression_,
     String filter_column_name_,
-    bool remove_filter_column)
-    : ISimpleTransform(header, transformHeader(header, expression_, filter_column_name_, remove_filter_column), true)
+    bool remove_filter_column_)
+    : ISimpleTransform(header_, transformHeader(header_, expression_, filter_column_name_, remove_filter_column_), true)
     , expression(std::move(expression_))
     , filter_column_name(std::move(filter_column_name_))
-    , remove_filter_column(remove_filter_column)
+    , remove_filter_column(remove_filter_column_)
 {
     transformed_header = getInputPort().getHeader();
     expression->execute(transformed_header);
@@ -62,7 +64,8 @@ FilterTransform::FilterTransform(
 
 IProcessor::Status FilterTransform::prepare()
 {
-    if (constant_filter_description.always_false)
+    if (constant_filter_description.always_false
+        || expression->checkColumnIsAlwaysFalse(filter_column_name))
     {
         input.close();
         output.finish();
@@ -128,7 +131,7 @@ void FilterTransform::transform(Chunk & chunk)
     size_t first_non_constant_column = num_columns;
     for (size_t i = 0; i < num_columns; ++i)
     {
-        if (!isColumnConst(*columns[i]))
+        if (i != filter_column_position && !isColumnConst(*columns[i]))
         {
             first_non_constant_column = i;
             break;

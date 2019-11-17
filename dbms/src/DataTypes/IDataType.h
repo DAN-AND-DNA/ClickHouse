@@ -3,7 +3,6 @@
 #include <memory>
 #include <Common/COW.h>
 #include <boost/noncopyable.hpp>
-#include <Core/Field.h>
 #include <DataTypes/DataTypeCustom.h>
 
 
@@ -19,6 +18,8 @@ struct FormatSettings;
 class IColumn;
 using ColumnPtr = COW<IColumn>::Ptr;
 using MutableColumnPtr = COW<IColumn>::MutablePtr;
+
+class Field;
 
 using DataTypePtr = std::shared_ptr<const IDataType>;
 using DataTypes = std::vector<DataTypePtr>;
@@ -98,7 +99,7 @@ public:
         /// Index of tuple element, starting at 1.
         String tuple_element_name;
 
-        Substream(Type type) : type(type) {}
+        Substream(Type type_) : type(type_) {}
     };
 
     using SubstreamPath = std::vector<Substream>;
@@ -463,9 +464,8 @@ struct WhichDataType
 {
     TypeIndex idx;
 
-    /// For late initialization.
-    WhichDataType()
-        : idx(TypeIndex::Nothing)
+    WhichDataType(TypeIndex idx_ = TypeIndex::Nothing)
+        : idx(idx_)
     {}
 
     WhichDataType(const IDataType & data_type)

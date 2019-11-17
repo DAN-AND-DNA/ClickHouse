@@ -1,6 +1,7 @@
 #pragma once
 #include <Processors/IProcessor.h>
 #include <Processors/Executors/PipelineExecutor.h>
+#include <Processors/Pipe.h>
 
 #include <DataStreams/IBlockInputStream.h>
 #include <DataStreams/IBlockOutputStream.h>
@@ -11,7 +12,7 @@ namespace DB
 
 class TableStructureReadLock;
 using TableStructureReadLockPtr = std::shared_ptr<TableStructureReadLock>;
-using TableStructureReadLocks = std::vector<TableStructureReadLockPtr>;
+using TableStructureReadLocks = std::vector<TableStructureReadLockHolder>;
 
 class Context;
 
@@ -22,8 +23,9 @@ class QueryPipeline
 public:
     QueryPipeline() = default;
 
-    /// Each source must have single output port and no inputs. All outputs must have same header.
-    void init(Processors sources);
+    /// All pipes must have same header.
+    void init(Pipes pipes);
+    void init(Pipe pipe); /// Simple init for single pipe
     bool initialized() { return !processors.empty(); }
 
     enum class StreamType
@@ -58,7 +60,7 @@ public:
     /// Check if resize transform was used. (In that case another distinct transform will be added).
     bool hasMixedStreams() const { return has_resize || hasMoreThanOneStream(); }
 
-    void resize(size_t num_streams);
+    void resize(size_t num_streams, bool force = false);
 
     void unitePipelines(std::vector<QueryPipeline> && pipelines, const Block & common_header, const Context & context);
 
@@ -72,7 +74,7 @@ public:
 
     const Block & getHeader() const { return current_header; }
 
-    void addTableLock(const TableStructureReadLockPtr & lock) { table_locks.push_back(lock); }
+    void addTableLock(const TableStructureReadLockHolder & lock) { table_locks.push_back(lock); }
 
     /// For compatibility with IBlockInputStream.
     void setProgressCallback(const ProgressCallback & callback);
@@ -80,6 +82,9 @@ public:
 
     /// Call after execution.
     void finalize();
+
+    void setMaxThreads(size_t max_threads_) { max_threads = max_threads_; }
+    size_t getMaxThreads() const { return max_threads; }
 
 private:
 
@@ -105,6 +110,8 @@ private:
     TableStructureReadLocks table_locks;
 
     IOutputFormat * output_format = nullptr;
+
+    size_t max_threads = 0;
 
     void checkInitialized();
     void checkSource(const ProcessorPtr & source, bool can_have_totals);

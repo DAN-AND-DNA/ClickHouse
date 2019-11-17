@@ -123,7 +123,7 @@ enum class TaskState
 struct TaskStateWithOwner
 {
     TaskStateWithOwner() = default;
-    TaskStateWithOwner(TaskState state, const String & owner) : state(state), owner(owner) {}
+    TaskStateWithOwner(TaskState state_, const String & owner_) : state(state_), owner(owner_) {}
 
     TaskState state{TaskState::Unknown};
     String owner;
@@ -895,7 +895,7 @@ public:
             ThreadPool thread_pool(num_threads ? num_threads : 2 * getNumberOfPhysicalCPUCores());
 
             for (const TaskShardPtr & task_shard : task_table.all_shards)
-                thread_pool.schedule([this, timeouts, task_shard]() { discoverShardPartitions(timeouts, task_shard); });
+                thread_pool.scheduleOrThrowOnError([this, timeouts, task_shard]() { discoverShardPartitions(timeouts, task_shard); });
 
             LOG_DEBUG(log, "Waiting for " << thread_pool.active() << " setup jobs");
             thread_pool.wait();
@@ -1932,15 +1932,13 @@ protected:
 
         TaskTable & task_table = task_shard.task_table;
 
-        String query;
-        {
-            WriteBufferFromOwnString wb;
-            wb << "SELECT 1"
-               << " FROM "<< getQuotedTable(task_shard.table_read_shard)
-               << " WHERE " << queryToString(task_table.engine_push_partition_key_ast) << " = " << partition_quoted_name
-               << " LIMIT 1";
-            query = wb.str();
-        }
+        std::string query = "SELECT 1 FROM " + getQuotedTable(task_shard.table_read_shard)
+            + " WHERE (" + queryToString(task_table.engine_push_partition_key_ast) + " = (" + partition_quoted_name + " AS partition_key))";
+
+        if (!task_table.where_condition_str.empty())
+            query += " AND (" + task_table.where_condition_str + ")";
+
+        query += " LIMIT 1";
 
         LOG_DEBUG(log, "Checking shard " << task_shard.getDescription() << " for partition "
                        << partition_quoted_name << " existence, executing query: " << query);
@@ -2040,7 +2038,7 @@ protected:
             ThreadPool thread_pool(std::min<UInt64>(num_shards, getNumberOfPhysicalCPUCores()));
 
             for (UInt64 shard_index = 0; shard_index < num_shards; ++shard_index)
-                thread_pool.schedule([=] { do_for_shard(shard_index); });
+                thread_pool.scheduleOrThrowOnError([=] { do_for_shard(shard_index); });
 
             thread_pool.wait();
         }
@@ -2100,9 +2098,9 @@ void ClusterCopierApp::initialize(Poco::Util::Application & self)
 
     // process_id is '<hostname>#<start_timestamp>_<pid>'
     time_t timestamp = Poco::Timestamp().epochTime();
-    auto pid = Poco::Process::id();
+    auto curr_pid = Poco::Process::id();
 
-    process_id = std::to_string(DateLUT::instance().toNumYYYYMMDDhhmmss(timestamp)) + "_" + std::to_string(pid);
+    process_id = std::to_string(DateLUT::instance().toNumYYYYMMDDhhmmss(timestamp)) + "_" + std::to_string(curr_pid);
     host_id = escapeForFileName(getFQDNOrHostName()) + '#' + process_id;
     process_path = Poco::Path(base_dir + "/clickhouse-copier_" + process_id).absolute().toString();
     Poco::File(process_path).createDirectories();

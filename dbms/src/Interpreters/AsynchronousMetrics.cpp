@@ -164,7 +164,10 @@ void AsynchronousMetrics::update()
 
         for (const auto & db : databases)
         {
-            for (auto iterator = db.second->getIterator(context); iterator->isValid(); iterator->next())
+            /// Lazy database can not contain MergeTree tables
+            if (db.second->getEngineName() == "Lazy")
+                continue;
+            for (auto iterator = db.second->getTablesIterator(context); iterator->isValid(); iterator->next())
             {
                 ++total_number_of_tables;
                 auto & table = iterator->table();
@@ -180,19 +183,22 @@ void AsynchronousMetrics::update()
                     calculateMaxAndSum(max_inserts_in_queue, sum_inserts_in_queue, status.queue.inserts_in_queue);
                     calculateMaxAndSum(max_merges_in_queue, sum_merges_in_queue, status.queue.merges_in_queue);
 
-                    try
+                    if (!status.is_readonly)
                     {
-                        time_t absolute_delay = 0;
-                        time_t relative_delay = 0;
-                        table_replicated_merge_tree->getReplicaDelays(absolute_delay, relative_delay);
+                        try
+                        {
+                            time_t absolute_delay = 0;
+                            time_t relative_delay = 0;
+                            table_replicated_merge_tree->getReplicaDelays(absolute_delay, relative_delay);
 
-                        calculateMax(max_absolute_delay, absolute_delay);
-                        calculateMax(max_relative_delay, relative_delay);
-                    }
-                    catch (...)
-                    {
-                        tryLogCurrentException(__PRETTY_FUNCTION__,
-                            "Cannot get replica delay for table: " + backQuoteIfNeed(db.first) + "." + backQuoteIfNeed(iterator->name()));
+                            calculateMax(max_absolute_delay, absolute_delay);
+                            calculateMax(max_relative_delay, relative_delay);
+                        }
+                        catch (...)
+                        {
+                            tryLogCurrentException(__PRETTY_FUNCTION__,
+                                "Cannot get replica delay for table: " + backQuoteIfNeed(db.first) + "." + backQuoteIfNeed(iterator->name()));
+                        }
                     }
 
                     calculateMax(max_part_count_for_partition, table_replicated_merge_tree->getMaxPartsCountForPartition());

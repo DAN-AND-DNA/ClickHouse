@@ -6,8 +6,10 @@
 #include <cstdint>
 
 #include <Core/Block.h>
+#include <Core/Defines.h>
 #include <Processors/Chunk.h>
 #include <Common/Exception.h>
+#include <common/likely.h>
 
 namespace DB
 {
@@ -16,6 +18,10 @@ class InputPort;
 class OutputPort;
 class IProcessor;
 
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
 
 class Port
 {
@@ -179,8 +185,8 @@ protected:
 public:
     using Data = State::Data;
 
-    Port(Block header) : header(std::move(header)) {}
-    Port(Block header, IProcessor * processor) : header(std::move(header)), processor(processor) {}
+    Port(Block header_) : header(std::move(header_)) {}
+    Port(Block header_, IProcessor * processor_) : header(std::move(header_)), processor(processor_) {}
 
     const Block & getHeader() const { return header; }
     bool ALWAYS_INLINE isConnected() const { return state != nullptr; }

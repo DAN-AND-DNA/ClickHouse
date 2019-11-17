@@ -6,12 +6,14 @@
 #include <Core/Types.h>
 #include <DataStreams/IBlockStream_fwd.h>
 #include <Interpreters/ClientInfo.h>
+#include <Interpreters/Users.h>
 #include <Parsers/IAST_fwd.h>
 #include <Common/LRUCache.h>
 #include <Common/MultiVersion.h>
 #include <Common/ThreadPool.h>
 #include "config_core.h"
 #include <Storages/IStorage_fwd.h>
+#include <Common/DiskSpaceMonitor.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -41,11 +43,10 @@ namespace DB
 
 struct ContextShared;
 class Context;
-class IRuntimeComponentsFactory;
 class QuotaForIntervals;
 class EmbeddedDictionaries;
-class ExternalDictionaries;
-class ExternalModels;
+class ExternalDictionariesLoader;
+class ExternalModelsLoader;
 class InterserverIOHandler;
 class BackgroundProcessingPool;
 class BackgroundSchedulePool;
@@ -62,7 +63,9 @@ class Clusters;
 class QueryLog;
 class QueryThreadLog;
 class PartLog;
+class TextLog;
 class TraceLog;
+class MetricLog;
 struct MergeTreeSettings;
 class IDatabase;
 class DDLGuard;
@@ -97,6 +100,14 @@ using TableAndCreateASTs = std::map<String, TableAndCreateAST>;
 /// Callback for external tables initializer
 using ExternalTablesInitializer = std::function<void(Context &)>;
 
+/// Callback for initialize input()
+using InputInitializer = std::function<void(Context &, const StoragePtr &)>;
+/// Callback for reading blocks of data from client for function input()
+using InputBlocksReader = std::function<Block(Context &)>;
+
+/// Scalar results of sub queries
+using Scalars = std::map<String, Block>;
+
 /// An empty interface for an arbitrary object that may be attached by a shared pointer
 /// to query context, when using ClickHouse as a library.
 struct IHostContext
@@ -121,6 +132,9 @@ private:
     ClientInfo client_info;
     ExternalTablesInitializer external_tables_initializer_callback;
 
+    InputInitializer input_initializer_callback;
+    InputBlocksReader input_blocks_reader;
+
     std::shared_ptr<QuotaForIntervals> quota;           /// Current quota. By default - empty quota, that have no limits.
     String current_database;
     Settings settings;                                  /// Setting for query execution.
@@ -133,6 +147,8 @@ private:
     String default_format;  /// Format, used when server formats data by itself and if query does not have FORMAT specification.
                             /// Thus, used in HTTP interface. If not specified - then some globally default format is used.
     TableAndCreateASTs external_tables;     /// Temporary tables.
+    Scalars scalars;
+    StoragePtr view_source;                 /// Temporary StorageValues used to generate alias columns for materialized views
     Tables table_function_results;          /// Temporary tables obtained by execution of table functions. Keyed by AST tree id.
     Context * query_context = nullptr;
     Context * session_context = nullptr;    /// Session context or nullptr. Could be equal to this.
@@ -161,7 +177,6 @@ private:
 
 public:
     /// Create initial Context with ContextShared and etc.
-    static Context createGlobal(std::unique_ptr<IRuntimeComponentsFactory> runtime_components_factory);
     static Context createGlobal();
 
     Context(const Context &);
@@ -197,6 +212,10 @@ public:
 
     /// Must be called before getClientInfo.
     void setUser(const String & name, const String & password, const Poco::Net::SocketAddress & address, const String & quota_key);
+
+    /// Used by MySQL Secure Password Authentication plugin.
+    std::shared_ptr<const User> getUser(const String & user_name);
+
     /// Compute and set actual user settings, client_info.current_user should be set
     void calculateUserSettings();
 
@@ -204,6 +223,17 @@ public:
     void setExternalTablesInitializer(ExternalTablesInitializer && initializer);
     /// This method is called in executeQuery() and will call the external tables initializer.
     void initializeExternalTablesIfSet();
+
+    /// When input() is present we have to send columns structure to client
+    void setInputInitializer(InputInitializer && initializer);
+    /// This method is called in StorageInput::read while executing query
+    void initializeInput(const StoragePtr & input_storage);
+
+    /// Callback for read data blocks from client one by one for function input()
+    void setInputBlocksReaderCallback(InputBlocksReader && reader);
+    /// Get callback for reading data for input()
+    InputBlocksReader getInputBlocksReaderCallback() const;
+    void resetInputCallbacks();
 
     ClientInfo & getClientInfo() { return client_info; }
     const ClientInfo & getClientInfo() const { return client_info; }
@@ -222,9 +252,11 @@ public:
     /// Checking the existence of the table/database. Database can be empty - in this case the current database is used.
     bool isTableExist(const String & database_name, const String & table_name) const;
     bool isDatabaseExist(const String & database_name) const;
+    bool isDictionaryExists(const String & database_name, const String & dictionary_name) const;
     bool isExternalTableExist(const String & table_name) const;
     bool hasDatabaseAccessRights(const String & database_name) const;
-    void assertTableExists(const String & database_name, const String & table_name) const;
+
+    bool hasDictionaryAccessRights(const String & dictionary_name) const;
 
     /** The parameter check_database_access_rights exists to not check the permissions of the database again,
       * when assertTableDoesntExist or assertDatabaseExists is called inside another function that already
@@ -236,14 +268,21 @@ public:
     void assertDatabaseDoesntExist(const String & database_name) const;
     void checkDatabaseAccessRights(const std::string & database_name) const;
 
+    const Scalars & getScalars() const;
+    const Block & getScalar(const String & name) const;
     Tables getExternalTables() const;
     StoragePtr tryGetExternalTable(const String & table_name) const;
     StoragePtr getTable(const String & database_name, const String & table_name) const;
     StoragePtr tryGetTable(const String & database_name, const String & table_name) const;
     void addExternalTable(const String & table_name, const StoragePtr & storage, const ASTPtr & ast = {});
+    void addScalar(const String & name, const Block & block);
+    bool hasScalar(const String & name) const;
     StoragePtr tryRemoveExternalTable(const String & table_name);
 
     StoragePtr executeTableFunction(const ASTPtr & table_expression);
+
+    void addViewSource(const StoragePtr & storage);
+    StoragePtr getViewSource();
 
     void addDatabase(const String & database_name, const DatabasePtr & database);
     DatabasePtr detachDatabase(const String & database_name);
@@ -253,6 +292,10 @@ public:
 
     String getCurrentDatabase() const;
     String getCurrentQueryId() const;
+
+    /// Id of initiating query for distributed queries; or current query id if it's not a distributed query.
+    String getInitialQueryId() const;
+
     void setCurrentDatabase(const String & name);
     void setCurrentQueryId(const String & query_id);
 
@@ -280,12 +323,15 @@ public:
     void checkSettingsConstraints(const SettingChange & change);
     void checkSettingsConstraints(const SettingsChanges & changes);
 
+    /// Returns the current constraints (can return null).
+    std::shared_ptr<const SettingsConstraints> getSettingsConstraints() const { return settings_constraints; }
+
     const EmbeddedDictionaries & getEmbeddedDictionaries() const;
-    const ExternalDictionaries & getExternalDictionaries() const;
-    const ExternalModels & getExternalModels() const;
+    const ExternalDictionariesLoader & getExternalDictionariesLoader() const;
+    const ExternalModelsLoader & getExternalModelsLoader() const;
     EmbeddedDictionaries & getEmbeddedDictionaries();
-    ExternalDictionaries & getExternalDictionaries();
-    ExternalModels & getExternalModels();
+    ExternalDictionariesLoader & getExternalDictionariesLoader();
+    ExternalModelsLoader & getExternalModelsLoader();
     void tryCreateEmbeddedDictionaries() const;
 
     /// I/O formats.
@@ -317,6 +363,7 @@ public:
     ASTPtr getCreateTableQuery(const String & database_name, const String & table_name) const;
     ASTPtr getCreateExternalTableQuery(const String & table_name) const;
     ASTPtr getCreateDatabaseQuery(const String & database_name) const;
+    ASTPtr getCreateDictionaryQuery(const String & database_name, const String & dictionary_name) const;
 
     const DatabasePtr getDatabase(const String & database_name) const;
     DatabasePtr getDatabase(const String & database_name);
@@ -427,8 +474,9 @@ public:
     /// Nullptr if the query log is not ready for this moment.
     std::shared_ptr<QueryLog> getQueryLog();
     std::shared_ptr<QueryThreadLog> getQueryThreadLog();
-
     std::shared_ptr<TraceLog> getTraceLog();
+    std::shared_ptr<TextLog> getTextLog();
+    std::shared_ptr<MetricLog> getMetricLog();
 
     /// Returns an object used to log opertaions with parts if it possible.
     /// Provide table name to make required cheks.
@@ -446,6 +494,16 @@ public:
 
     /// Lets you select the compression codec according to the conditions described in the configuration file.
     std::shared_ptr<ICompressionCodec> chooseCompressionCodec(size_t part_size, double part_size_ratio) const;
+
+    DiskSpace::DiskSelector & getDiskSelector() const;
+
+    /// Provides storage disks
+    const DiskSpace::DiskPtr & getDisk(const String & name) const;
+
+    DiskSpace::StoragePolicySelector & getStoragePolicySelector() const;
+
+    /// Provides storage politics schemes
+    const DiskSpace::StoragePolicyPtr & getStoragePolicy(const String &name) const;
 
     /// Get the server uptime in seconds.
     time_t getUptimeSeconds() const;
@@ -486,6 +544,7 @@ public:
     bool hasQueryParameters() const;
     const NameToNameMap & getQueryParameters() const;
     void setQueryParameter(const String & name, const String & value);
+    void setQueryParameters(const NameToNameMap & parameters) { query_parameters = parameters; }
 
 #if USE_EMBEDDED_COMPILER
     std::shared_ptr<CompiledExpressionCache> getCompiledExpressionCache() const;
@@ -494,7 +553,7 @@ public:
 #endif
 
     /// Add started bridge command. It will be killed after context destruction
-    void addXDBCBridgeCommand(std::unique_ptr<ShellCommand> cmd);
+    void addXDBCBridgeCommand(std::unique_ptr<ShellCommand> cmd) const;
 
     IHostContextPtr & getHostContext();
     const IHostContextPtr & getHostContext() const;
